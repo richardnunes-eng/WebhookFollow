@@ -811,21 +811,23 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
                 });
                 const fingerprint = computeFingerprint(rotaReferencia, flatItems);
                 const previousFingerprint = getRouteFingerprint(rotaReferencia);
-                rotasBaixadasComSucesso.add(rotaReferencia);
+                const gmChanged = !previousFingerprint || previousFingerprint !== fingerprint;
+                if (gmChanged) {
+                  rotasBaixadasComSucesso.add(rotaReferencia);
+                  houveMudancas = true;
+                  console.log(`🐛 [WF] Rota ${rotaReferencia} com fingerprint alterado.`);
+                } else {
+                  console.log(`🐛 [WF] Rota ${rotaReferencia} sem mudança no fingerprint; verificando status.`);
+                }
                 rotasPlanejadas.set(rotaReferencia, itemsList.length);
 
-                if (previousFingerprint && previousFingerprint === fingerprint) {
-                  console.log(`🐛 [WF] Rota ${rotaReferencia} sem mudanças (fingerprint).`);
-                  return;
-                }
-
                 const entradaSaidaMudou = detectarMudancasEntradaSaida(flatItems, rotaReferencia, mapaEntradaSaida, logAlteracoesEntradaSaida);
-                if (!entradaSaidaMudou) {
+                if (entradaSaidaMudou) {
+                  houveMudancas = true;
+                } else {
                   console.log(`🐛 [LOG] Rota ${rotaReferencia} sem alterações de entrada/saída.`);
-                  return;
                 }
 
-                houveMudancas = true;
                 console.log(`🐛 [DEBUG] Rota ${rotaReferencia}: ${itemsList.length} itens`);
 
                 const clickupUrlFinal = taskIdFromWebhook
@@ -863,8 +865,9 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
                     } else {
                       subtasksSemSaida.delete(subtaskInfo.subtaskId);
                     }
-                    console.log(`   🐛 [STATUS] Cliente ${codigoCliente}: saída="${flatItem["stop.actualDeparture"] || "N/A"}" | deliveryStatus="${flatItem["stop.deliveryStatus"] || "N/A"}" | motivo="${flatItem["stop.undeliverableCode.description"] || "N/A"}" | novoStatus="${novoStatus || "null"}" | statusAtual="${subtaskInfo.status}"`);
-                    if (novoStatus && novoStatus !== subtaskInfo.status) {
+                    const clickUpNeedsUpdate = novoStatus !== subtaskInfo.status;
+                    console.log(`   🐛 [STATUS] Cliente ${codigoCliente}: saída="${flatItem["stop.actualDeparture"] || "N/A"}" | deliveryStatus="${flatItem["stop.deliveryStatus"] || "N/A"}" | motivo="${flatItem["stop.undeliverableCode.description"] || "N/A"}" | novoStatus="${novoStatus}" | statusAtual="${subtaskInfo.status}" | gmChanged=${gmChanged} | needsPatch=${clickUpNeedsUpdate}`);
+                    if (clickUpNeedsUpdate) {
                       statusUpdates.push({
                         subtaskId: subtaskInfo.subtaskId,
                         novoStatus: novoStatus,
@@ -880,15 +883,18 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
                     flatItem["clickup.nfes"] = "";
                   }
 
-                  novosRegistros.push(flatItem);
+                  if (gmChanged) {
+                    novosRegistros.push(flatItem);
+                  }
                 });
 
                 if (statusUpdates.length > 0) {
                   console.log(`🔄 Atualizando ${statusUpdates.length} status em paralelo...`);
                   atualizarStatusEmBatch(statusUpdates);
+                  houveMudancas = true;
                 }
 
-                if (fingerprint) {
+                if (gmChanged && fingerprint) {
                   setRouteFingerprint(rotaReferencia, fingerprint);
                   markPlanChanged();
                 }
@@ -1361,33 +1367,39 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
    * @returns {string|null} - "Retorno", "Finalizado" ou null (não alterar)
    */
   function determinarStatusSubtask(dadosGM) {
-    const deliveryStatus = String(dadosGM["stop.deliveryStatus"] || "").toUpperCase();
-    const motivoDevolucao = dadosGM["stop.undeliverableCode.description"];
-    const saida = dadosGM["stop.actualDeparture"];
+    return computeRouteStatus(dadosGM);
+  }
 
-    // Se tem motivo de devolução -> Retorno
-    if (motivoDevolucao && String(motivoDevolucao).trim() !== "") {
-      return "Retorno";
-    }
+  function computeRouteStatus(flatItem) {
+    const deliveryStatus = String(flatItem["stop.deliveryStatus"] || "").toLowerCase();
+    const motivoDevolucao = String(flatItem["stop.undeliverableCode.description"] || "").toLowerCase();
+    const hasArrival = valorTemHorario(flatItem["stop.actualArrival"]);
+    const hasDeparture = valorTemHorario(flatItem["stop.actualDeparture"]);
 
-    // Se o status indica devolução/cancelamento
-    if (deliveryStatus.includes("UNDELIVERED") ||
-      deliveryStatus.includes("CANCELED") ||
-      deliveryStatus.includes("RETURNED")) {
-      return "Retorno";
-    }
+    const deliveredKeywords = ["delivered", "entreg", "finaliz", "done", "complete"];
+    const inProgressKeywords = ["in_progress", "in progress", "andamento", "em rota", "progress"];
+    const pendingKeywords = ["pending", "pendente", "scheduled", "agend"];
+    const exceptionKeywords = ["undelivered", "returned", "retorno", "devolu"];
+    const canceledKeywords = ["cancel", "sinistro"];
 
-    // Se tem data de saída e status indica entregue -> Finalizado
-    if (saida && deliveryStatus.includes("DELIVERED")) {
-      return "Finalizada";
-    }
+    const includesAny = (keywords) => keywords.some(keyword => deliveryStatus.includes(keyword));
 
-    // Se tem data de saída (finalizou a parada) -> Finalizado
-    if (saida) {
-      return "Finalizada";
-    }
+    if (motivoDevolucao && motivoDevolucao.trim().length > 0) return "Retorno";
+    if (includesAny(exceptionKeywords) || includesAny(canceledKeywords)) return "Retorno";
 
-    return null; // Não alterar
+    const isDelivered = includesAny(deliveredKeywords);
+    const isInProgress = includesAny(inProgressKeywords);
+    const isPending = includesAny(pendingKeywords);
+
+    if (isDelivered && hasDeparture) return "Finalizada";
+    if (isDelivered && !hasDeparture) return "No Cliente";
+    if (isInProgress && !hasDeparture) return "No Cliente";
+    if (isInProgress && hasDeparture) return "Em Rota";
+    if (isPending && hasArrival && !hasDeparture) return "No Cliente";
+    if (isPending && !hasArrival) return "Em Rota";
+    if (hasArrival && !hasDeparture) return "No Cliente";
+
+    return "Em Rota";
   }
 
   function valoresParaObjetos(values) {
