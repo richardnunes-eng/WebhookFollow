@@ -9,10 +9,24 @@ const PROPERTY_GM_TOKEN_EXPIRES = "WF_GM_TOKEN_EXPIRES";
 const PROPERTY_CLICKUP_CURSOR = "WF_CLICKUP_CURSOR";
 const PROPERTY_MONITORED_ROUTES = "WF_MONITORED_ROUTES";
 const PROPERTY_RUNNER_ERROR_STREAK = "WF_RUNNER_ERROR_STREAK";
+const PROPERTY_BATCH_DATA_VERSION = "WF_BATCH_DATA_VERSION";
+const PROPERTY_WEBHOOK_HEARTBEAT = "SITE_WEBHOOK_HEARTBEAT";
+const PROPERTY_MODE = "MODE";
 const MAX_LOG_BODY_LENGTH = 2000;
 const GM_LOGIN_URL = "https://3coracoes.greenmile.com/login";
 
 const RUNNER_OPERATIONAL_WINDOW = { startHour: 6, endHour: 19 };
+
+const MODE_BATCH_WEBHOOK = "BATCH_WEBHOOK";
+const MODE_LEGACY = "LEGACY";
+const DEFAULT_MODE = MODE_BATCH_WEBHOOK;
+const GM_BATCH_SIZE = 50;
+const SITE_WEBHOOK_URL_KEY = "SITE_WEBHOOK_URL";
+const SITE_WEBHOOK_SECRET_KEY = "SITE_WEBHOOK_SECRET";
+const SITE_WEBHOOK_MODE_KEY = "SITE_WEBHOOK_MODE";
+const SITE_WEBHOOK_MODE_DELTA = "delta";
+const SITE_WEBHOOK_MODE_PULL = "pull";
+const VOLATILE_FIELD_PATTERNS = ["lastupdated", "updated", "created", "timestamp", "now"];
 
 const DEFAULT_CLICKUP_TOKEN = typeof CLICKUP_TOKEN === "undefined" ? "" : CLICKUP_TOKEN;
 const DEFAULT_GM_USERNAME = typeof GM_USERNAME === "undefined" ? "" : GM_USERNAME;
@@ -36,7 +50,14 @@ function runnerMain() {
 
   let delay = RUNNER_INTERVAL_MS;
   try {
-    processRunnerTasks(PropertiesService.getScriptProperties(), telemetry);
+    const scriptProps = PropertiesService.getScriptProperties();
+    const mode = determineRunnerMode(scriptProps);
+    console.log(`[WF][${telemetry.execId}] runner mode=${mode}`);
+    if (mode === MODE_LEGACY) {
+      processRunnerTasks(scriptProps, telemetry);
+    } else {
+      processBatchRunnerTasks(scriptProps, telemetry);
+    }
     telemetry.status = "ok";
   } catch (error) {
     telemetry.status = "error";
@@ -103,6 +124,122 @@ function processRunnerTasks(scriptProps, telemetry) {
   console.log(`[WF][${telemetry.execId}] processed ${telemetry.counters.plansChecked} planos; monitorando ${Object.keys(updatedRoutes).length}.`);
 }
 
+function determineRunnerMode(scriptProps) {
+  const rawMode = scriptProps ? scriptProps.getProperty(PROPERTY_MODE) : null;
+  if (!rawMode) return DEFAULT_MODE;
+  const normalized = String(rawMode).trim().toUpperCase();
+  return normalized === MODE_LEGACY ? MODE_LEGACY : MODE_BATCH_WEBHOOK;
+}
+
+function processBatchRunnerTasks(scriptProps, telemetry) {
+  if (!LOOP_CLICKUP_LIST_ID) {
+    throw new Error("LOOP_CLICKUP_LIST_ID não configurado.");
+  }
+
+  const tasks = buscarTasksAtivasDaLista(LOOP_CLICKUP_LIST_ID);
+  telemetry.counters.plansTotal = tasks.length;
+  telemetry.counters.plansChecked = tasks.length;
+  const routeMap = buildRouteMapFromTasks(tasks);
+  const routeKeys = Array.from(routeMap.keys());
+  telemetry.counters.checkedRoutes = routeKeys.length;
+
+  console.log(`[WF][${telemetry.execId}] batch checking ${routeKeys.length} rota(s)`);
+
+  if (routeKeys.length === 0) {
+    maybeSendHeartbeat(scriptProps, telemetry);
+    return;
+  }
+
+  const snapshots = fetchGreenMileSnapshots(routeKeys);
+  telemetry.counters.batchFetchCount = routeKeys.length;
+  const changedCandidates = [];
+
+  routeKeys.forEach((routeKey) => {
+    const snapshot = snapshots[routeKey];
+    if (!snapshot || snapshot.error) {
+      console.warn(`[WF][${telemetry.execId}] rota ${routeKey} falhou ao baixar dados: ${snapshot ? snapshot.error : "sem dados"}`);
+      return;
+    }
+    const previousFingerprint = getRouteFingerprint(routeKey);
+    if (!previousFingerprint || previousFingerprint !== snapshot.fingerprint) {
+      changedCandidates.push(routeKey);
+    }
+  });
+
+  telemetry.counters.changedRoutes = changedCandidates.length;
+
+  if (changedCandidates.length === 0) {
+    console.log(`[WF][${telemetry.execId}] nenhuma mudança detectada.`);
+    maybeSendHeartbeat(scriptProps, telemetry);
+    return;
+  }
+
+  const patchedRoutes = [];
+  const patchErrors = [];
+
+  changedCandidates.forEach((routeKey) => {
+    const routeInfo = routeMap.get(routeKey);
+    const taskId = routeInfo ? routeInfo.taskId : null;
+    try {
+      sincronizarGreenMileStable(taskId, true);
+      patchedRoutes.push(routeKey);
+    } catch (error) {
+      patchErrors.push({ routeKey, error: error.message });
+      console.error(`[WF][${telemetry.execId}] erro ao sincronizar ${routeKey}: ${error.message}`);
+      incrementTelemetryCounter("cuErrors");
+    }
+  });
+
+  telemetry.counters.patchedRoutes = patchedRoutes.length;
+
+  if (patchedRoutes.length === 0) {
+    console.warn(`[WF][${telemetry.execId}] mudanças detectadas, mas nenhuma rota patchada.`);
+    return;
+  }
+
+  const dataVer = incrementDataVersion(scriptProps);
+  const requestedMode = String(getConfiguredValue(SITE_WEBHOOK_MODE_KEY, SITE_WEBHOOK_MODE_DELTA) || SITE_WEBHOOK_MODE_DELTA).trim().toLowerCase();
+  const payloadMode = requestedMode === SITE_WEBHOOK_MODE_PULL ? SITE_WEBHOOK_MODE_PULL : SITE_WEBHOOK_MODE_DELTA;
+  const payload = {
+    source: "WebhookFollow",
+    execId: telemetry.execId,
+    dataVer: String(dataVer),
+    ts: Date.now(),
+    counters: {
+      checked: routeKeys.length,
+      changed: patchedRoutes.length,
+      errors: patchErrors.length
+    },
+    mode: payloadMode
+  };
+
+  if (payloadMode === SITE_WEBHOOK_MODE_DELTA) {
+    payload.changedRouteIds = patchedRoutes;
+  }
+
+  const sent = sitePublishUpdate_(payload);
+  if (sent) {
+    telemetry.counters.webhookSent += 1;
+  }
+}
+
+function buildRouteMapFromTasks(tasks) {
+  const map = new Map();
+  (tasks || []).forEach((task) => {
+    if (!task || !task.id) return;
+    const routeKey = extractRouteKey(task);
+    if (!routeKey) return;
+    const trimmed = String(routeKey).trim();
+    if (!trimmed) return;
+    const existing = map.get(trimmed) || { taskIds: [] };
+    existing.taskIds.push(task.id);
+    existing.taskId = existing.taskId || task.id;
+    existing.taskName = task.name || existing.taskName;
+    map.set(trimmed, existing);
+  });
+  return map;
+}
+
 function createTelemetry() {
   const startTs = Date.now();
   return {
@@ -117,9 +254,179 @@ function createTelemetry() {
       plansChanged: 0,
       clickUpPatched: 0,
       gmErrors: 0,
-      cuErrors: 0
+      cuErrors: 0,
+      batchFetchCount: 0,
+      checkedRoutes: 0,
+      changedRoutes: 0,
+      patchedRoutes: 0,
+      webhookSent: 0
     }
   };
+}
+
+function fetchGreenMileSnapshots(routeKeys) {
+  const result = Object.create(null);
+  if (!Array.isArray(routeKeys) || routeKeys.length === 0) {
+    return result;
+  }
+
+  const token = getGreenMileToken_();
+  for (let i = 0; i < routeKeys.length; i += GM_BATCH_SIZE) {
+    const chunk = routeKeys.slice(i, i + GM_BATCH_SIZE);
+    const requests = chunk.map((routeKey) => buildGreenMileRequest(token, routeKey));
+    const responses = gmFetchBatch_("gm-batch", requests);
+    chunk.forEach((routeKey, index) => {
+      const response = responses[index];
+      if (response.getResponseCode() !== 200) {
+        incrementTelemetryCounter("gmErrors");
+        result[routeKey] = {
+          error: `HTTP ${response.getResponseCode()}`,
+          status: response.getResponseCode(),
+          body: sanitizeBody(response.getContentText())
+        };
+        return;
+      }
+      try {
+        const json = JSON.parse(response.getContentText());
+        const items = json.content || json.rows || json.items || json;
+        const normalized = normalizeRouteSnapshot(routeKey, Array.isArray(items) ? items : []);
+        const fingerprint = computeFingerprint(routeKey, normalized);
+        result[routeKey] = { fingerprint, rows: normalized.length, items: normalized };
+      } catch (error) {
+        incrementTelemetryCounter("gmErrors");
+        console.error(`[WF] falha ao processar resposta GM para ${routeKey}: ${error.message}`);
+        result[routeKey] = { error: error.message };
+      }
+    });
+    if (i + GM_BATCH_SIZE < routeKeys.length) {
+      Utilities.sleep(100);
+    }
+  }
+  return result;
+}
+
+function normalizeRouteSnapshot(routeKey, items) {
+  return (items || []).map((item) => {
+    const flat = flattenObject(Object.assign({}, item), "");
+    if (!flat["route.key"]) {
+      flat["route.key"] = routeKey;
+    }
+    const ordersInfo = flat["stop.ordersInfo"];
+    if (ordersInfo) {
+      flat["stop.orders.number"] = String(ordersInfo).replace(/[\[\]"']/g, "");
+    }
+    flat["stop.plannedSize3"] = parseNumeroSeguro(
+      flat["stop.plannedSize3"] ?? flat["stop.plannedSize3.value"] ?? flat["stop.plannedSize3.amount"]
+    );
+    flat["stop.plannedSize1"] = parseNumeroSeguro(flat["stop.plannedSize1"] || 0);
+    const sequence = Number.parseInt(flat["stop.plannedSequenceNum"] || 0, 10);
+    flat["stop.plannedSequenceNum"] = Number.isNaN(sequence) ? 0 : sequence;
+    delete flat["stop.ordersInfo"];
+    return removeVolatileKeys(flat);
+  });
+}
+
+function buildGreenMileRequest(token, routeKey) {
+  const allowedFields = (COLUNAS_GM || []).filter((field) => !field.startsWith("clickup."));
+  const criteriaUrlObj = { filters: allowedFields, viewType: "STOP", firstResult: 0, maxResults: 1000 };
+  const payloadBody = {
+    criteriaChain: [{ and: [{ attr: "route.key", eq: routeKey, matchMode: "EXACT" }] }],
+    sort: [{ attr: "stop.plannedSequenceNum", type: "ASC" }]
+  };
+  return {
+    url: `${GM_URL_BASE}?criteria=${encodeURIComponent(JSON.stringify(criteriaUrlObj))}`,
+    method: "POST",
+    contentType: "application/json;charset=UTF-8",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Greenmile-Module": "LIVE",
+      Accept: "application/json"
+    },
+    payload: JSON.stringify(payloadBody),
+    muteHttpExceptions: true
+  };
+}
+
+function removeVolatileKeys(entry) {
+  const sanitized = {};
+  Object.keys(entry || {}).forEach((key) => {
+    const lower = key.toLowerCase();
+    if (key.startsWith("clickup.")) return;
+    if (VOLATILE_FIELD_PATTERNS.some((pattern) => lower.includes(pattern))) return;
+    sanitized[key] = entry[key];
+  });
+  return sanitized;
+}
+
+function maybeSendHeartbeat(scriptProps, telemetry) {
+  if (!isWebhookHeartbeatEnabled()) return;
+  const dataVer = getCurrentDataVersion(scriptProps);
+  const payload = {
+    source: "WebhookFollow",
+    execId: telemetry.execId,
+    dataVer: String(dataVer),
+    ts: Date.now(),
+    mode: "heartbeat",
+    counters: {
+      checked: telemetry.counters.checkedRoutes || 0,
+      changed: 0,
+      errors: 0
+    }
+  };
+  if (sitePublishUpdate_(payload)) {
+    telemetry.counters.webhookSent += 1;
+  }
+}
+
+function isWebhookHeartbeatEnabled() {
+  const heartbeatFlag = getConfiguredValue(PROPERTY_WEBHOOK_HEARTBEAT, "false");
+  return String(heartbeatFlag || "").trim().toLowerCase() === "true";
+}
+
+function incrementDataVersion(scriptProps) {
+  const current = Number(scriptProps.getProperty(PROPERTY_BATCH_DATA_VERSION) || "0");
+  const next = current + 1;
+  scriptProps.setProperty(PROPERTY_BATCH_DATA_VERSION, String(next));
+  return next;
+}
+
+function getCurrentDataVersion(scriptProps) {
+  return Number(scriptProps.getProperty(PROPERTY_BATCH_DATA_VERSION) || "0");
+}
+
+function sitePublishUpdate_(payload) {
+  const webhookUrl = getConfiguredValue(SITE_WEBHOOK_URL_KEY, "");
+  if (!webhookUrl) {
+    console.log("[WF] site webhook não configurado.");
+    return false;
+  }
+  const body = JSON.stringify(payload);
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: body,
+    muteHttpExceptions: true,
+    headers: {}
+  };
+  const secret = getConfiguredValue(SITE_WEBHOOK_SECRET_KEY, "");
+  if (secret) {
+    options.headers["X-WF-Signature"] = buildSiteSignature(body, secret);
+  }
+
+  try {
+    const response = UrlFetchApp.fetch(webhookUrl, options);
+    logHttpResponse("site-webhook", webhookUrl, response, null);
+    const code = response.getResponseCode();
+    return code >= 200 && code < 300;
+  } catch (error) {
+    console.error(`[WF] falha ao enviar webhook para o site: ${error.message}`);
+    return false;
+  }
+}
+
+function buildSiteSignature(body, secret) {
+  const digest = Utilities.computeHmacSignature(Utilities.MacAlgorithm.HMAC_SHA_256, body, secret);
+  return digest.map((byte) => (`0${(byte & 0xff).toString(16)}`).slice(-2)).join("");
 }
 
 function persistTelemetrySummary(telemetry) {

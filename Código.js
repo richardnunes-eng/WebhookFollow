@@ -384,6 +384,58 @@ function doGet(e) {
   return ContentService.createTextOutput(JSON.stringify({ status: "online" })).setMimeType(ContentService.MimeType.JSON);
 }
 
+function getSnapshot(e) {
+  const scriptProps = PropertiesService.getScriptProperties();
+  try {
+    const params = e && e.parameter ? e.parameter : {};
+    const rawRoutes = params.routes || params.routeKeys || "";
+    let routeKeys = rawRoutes
+      .split(",")
+      .map((value) => String(value || "").trim())
+      .filter((value) => value);
+
+    if (routeKeys.length === 0) {
+      if (!LOOP_CLICKUP_LIST_ID) {
+        throw new Error("LOOP_CLICKUP_LIST_ID não configurado para build de snapshot.");
+      }
+      const tasks = buscarTasksAtivasDaLista(LOOP_CLICKUP_LIST_ID);
+      routeKeys = Array.from(buildRouteMapFromTasks(tasks).keys());
+    }
+
+    const snapshots = fetchGreenMileSnapshots(routeKeys);
+    const dataVer = getCurrentDataVersion(scriptProps);
+    const items = routeKeys.map((routeKey) => {
+      const snapshot = snapshots[routeKey] || {};
+      return {
+        routeKey,
+        fingerprint: snapshot.fingerprint || null,
+        rows: snapshot.rows || 0,
+        error: snapshot.error || null,
+        items: snapshot.items || []
+      };
+    });
+
+    return ContentService.createTextOutput(
+      JSON.stringify({
+        status: "success",
+        data: {
+          dataVer: String(dataVer),
+          snapshotTs: Date.now(),
+          items
+        }
+      })
+    ).setMimeType(ContentService.MimeType.JSON);
+  } catch (error) {
+    console.error(`[WF] getSnapshot error: ${error.message}`);
+    return ContentService.createTextOutput(
+      JSON.stringify({
+        status: "error",
+        message: error.message
+      })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
 // === VER TRACE DA ÚLTIMA EXECUÇÃO ===
 function verTrace() {
   const trace = PropertiesService.getScriptProperties().getProperty("LAST_TRACE");
@@ -1338,14 +1390,6 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     return null; // Não alterar
   }
 
-  function parseNumeroSeguro(valor) {
-    if (valor === null || valor === undefined) return 0;
-    if (typeof valor === "number") return valor;
-    const normalizado = String(valor).replace(/[^\d,.-]/g, "").replace(/\.(?=.*\.)/g, "").replace(",", ".");
-    const parsed = parseFloat(normalizado);
-    return Number.isNaN(parsed) ? 0 : parsed;
-  }
-
   function valoresParaObjetos(values) {
     let headers = values[0];
     let result = [];
@@ -1563,24 +1607,6 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     logSheet.appendRow([routeKey, taskId || "", new Date(), "Finalizada"]);
   }
 
-  function flattenObject(ob, prefix) {
-    let toReturn = {};
-    for (let i in ob) {
-      if (!ob.hasOwnProperty(i)) continue;
-      let key = prefix ? prefix + "." + i : i;
-      if ((typeof ob[i]) === 'object' && ob[i] !== null) {
-        if (ob[i] instanceof Date) toReturn[key] = ob[i].toISOString();
-        else {
-          let f = flattenObject(ob[i], key);
-          for (let x in f) toReturn[x] = f[x];
-        }
-      } else {
-        toReturn[key] = ob[i];
-      }
-    }
-    return toReturn;
-  }
-
   function detectarMudancasEntradaSaida(flatItems, routeKey, mapa, logAlteracoes) {
     if (!Array.isArray(flatItems) || !routeKey) return false;
     let changed = false;
@@ -1717,4 +1743,34 @@ function limparCacheNotificacoes() {
     rotasFinalizadasReset: tinhaRotas,
     timestamp: new Date().toISOString()
   };
+}
+
+function parseNumeroSeguro(valor) {
+  if (valor === null || valor === undefined) return 0;
+  if (typeof valor === "number") return valor;
+  const normalizado = String(valor).replace(/[^\d,.-]/g, "").replace(/\.(?=.*\.)/g, "").replace(",", ".");
+  const parsed = parseFloat(normalizado);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function flattenObject(ob, prefix) {
+  let toReturn = {};
+  for (let i in ob) {
+    if (!Object.prototype.hasOwnProperty.call(ob, i)) continue;
+    let key = prefix ? `${prefix}.${i}` : i;
+    if (typeof ob[i] === "object" && ob[i] !== null) {
+      if (ob[i] instanceof Date) toReturn[key] = ob[i].toISOString();
+      else {
+        let f = flattenObject(ob[i], key);
+        for (let x in f) {
+          if (Object.prototype.hasOwnProperty.call(f, x)) {
+            toReturn[x] = f[x];
+          }
+        }
+      }
+    } else {
+      toReturn[key] = ob[i];
+    }
+  }
+  return toReturn;
 }
