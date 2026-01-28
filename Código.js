@@ -33,7 +33,6 @@ const LOOP_FETCH_BATCH_PAGES = 4;
 const LOOP_STATUS_EXCLUDE = ["cancelado", "sinistro"];
 const CACHE_TTL_TASK_SECONDS = 120;
 const CACHE_TTL_SUBTASK_SECONDS = 300;
-const CACHE_TTL_GM_TOKEN_SECONDS = 1800;
 const CACHE_TTL_TIMER_SECONDS = 600;
 const SNAPSHOT_KEY_PREFIX = "GM_ROUTE_SNAPSHOT:";
 const SHEET_NAME_SNAPSHOT_ENTRADA_SAIDA = "GM Snapshot EntradaSaida";
@@ -287,10 +286,11 @@ function buscarTasksAtivasDaLista(listId) {
   const baseUrl = `https://api.clickup.com/api/v2/list/${listId}/task`;
   const results = [];
   let currentPage = 0;
+  const clickUpToken = getClickUpToken_();
   const optionsBase = {
     method: "GET",
     headers: {
-      "Authorization": CLICKUP_TOKEN,
+      "Authorization": clickUpToken,
       "Content-Type": "application/json"
     },
     muteHttpExceptions: true
@@ -712,16 +712,20 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
   let rotasBaixadasComSucesso = new Set();
 
   if (listaDownload.length > 0) {
-    const token = obterTokenJWT();
-    console.log(`🐛 [DEBUG] Token obtido: ${token ? "SIM (" + token.substring(0, 20) + "...)" : "NÃO"}`);
-
+    let token = null;
+    try {
+      token = getGreenMileToken_();
+      console.log("🐛 [DEBUG] Token GreenMile disponível.");
+    } catch (tokenError) {
+      console.error(`❌ Falha ao obter token GreenMile: ${tokenError.message}`);
+    }
     if (token) {
       for (let i = 0; i < listaDownload.length; i += TAMANHO_LOTE) {
         const loteAtual = listaDownload.slice(i, i + TAMANHO_LOTE);
         const requests = loteAtual.map(rota => prepararRequest(token, rota, COLUNAS_GM));
 
         try {
-          const responses = UrlFetchApp.fetchAll(requests);
+          const responses = gmFetchBatch_("gm-rotas", requests);
           console.log(`🐛 [DEBUG] Lote processado: ${loteAtual.length} rotas`);
 
           responses.forEach((res, index) => {
@@ -753,6 +757,15 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
                   flatItem["stop.plannedSequenceNum"] = parseInt(flatItem["stop.plannedSequenceNum"] || 0);
                   return flatItem;
                 });
+                const fingerprint = computeFingerprint(rotaReferencia, flatItems);
+                const previousFingerprint = getRouteFingerprint(rotaReferencia);
+                rotasBaixadasComSucesso.add(rotaReferencia);
+                rotasPlanejadas.set(rotaReferencia, itemsList.length);
+
+                if (previousFingerprint && previousFingerprint === fingerprint) {
+                  console.log(`🐛 [WF] Rota ${rotaReferencia} sem mudanças (fingerprint).`);
+                  return;
+                }
 
                 const entradaSaidaMudou = detectarMudancasEntradaSaida(flatItems, rotaReferencia, mapaEntradaSaida, logAlteracoesEntradaSaida);
                 if (!entradaSaidaMudou) {
@@ -761,8 +774,6 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
                 }
 
                 houveMudancas = true;
-                rotasBaixadasComSucesso.add(rotaReferencia);
-                rotasPlanejadas.set(rotaReferencia, itemsList.length);
                 console.log(`🐛 [DEBUG] Rota ${rotaReferencia}: ${itemsList.length} itens`);
 
                 const clickupUrlFinal = taskIdFromWebhook
@@ -823,6 +834,11 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
                 if (statusUpdates.length > 0) {
                   console.log(`🔄 Atualizando ${statusUpdates.length} status em paralelo...`);
                   atualizarStatusEmBatch(statusUpdates);
+                }
+
+                if (fingerprint) {
+                  setRouteFingerprint(rotaReferencia, fingerprint);
+                  markPlanChanged();
                 }
               } catch (e) { console.warn(`Erro parse: ${e.message}`); }
             }
@@ -1035,18 +1051,9 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     }
 
     const url = `https://api.clickup.com/api/v2/task/${taskId}?include_subtasks=true`;
-    const options = {
-      method: "GET",
-      headers: {
-        "Authorization": CLICKUP_TOKEN,
-        "Content-Type": "application/json"
-      },
-      muteHttpExceptions: true
-    };
-
     try {
       console.log(`🔍 Buscando task ${taskId} no ClickUp...`);
-      const response = UrlFetchApp.fetch(url, options);
+      const response = cuFetch_("cu-task", url, { method: "GET" });
       const code = response.getResponseCode();
 
       console.log(`🐛 [DEBUG] ClickUp response code: ${code}`);
@@ -1109,11 +1116,12 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     console.log(`📋 Buscando ${missingSubtasks.length} subtasks em paralelo...`);
 
     // Prepara todas as requisições para buscar em paralelo
+    const clickUpToken = getClickUpToken_();
     const requests = missingSubtasks.map(subtask => ({
       url: `https://api.clickup.com/api/v2/task/${subtask.id}`,
       method: "GET",
       headers: {
-        "Authorization": CLICKUP_TOKEN,
+        "Authorization": clickUpToken,
         "Content-Type": "application/json"
       },
       muteHttpExceptions: true
@@ -1204,22 +1212,18 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     const url = `https://api.clickup.com/api/v2/task/${taskId}/field/${fieldId}`;
     const options = {
       method: "POST", // ClickUp usa POST para atualizar valor de custom field específico
-      headers: {
-        "Authorization": CLICKUP_TOKEN,
-        "Content-Type": "application/json"
-      },
       payload: JSON.stringify({
         value: valor
-      }),
-      muteHttpExceptions: true
+      })
     };
 
     try {
       console.log(`🔄 Atualizando custom field no ClickUp (Task: ${taskId})...`);
-      const response = UrlFetchApp.fetch(url, options);
+      const response = cuFetch_("cu-field", url, options);
       const code = response.getResponseCode();
 
       if (code === 200 || code === 204) {
+        markClickUpPatched();
         console.log(`   ✅ Campo personalizado atualizado com sucesso.`);
         return true;
       } else {
@@ -1242,22 +1246,18 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     const url = `https://api.clickup.com/api/v2/task/${subtaskId}`;
     const options = {
       method: "PUT",
-      headers: {
-        "Authorization": CLICKUP_TOKEN,
-        "Content-Type": "application/json"
-      },
       payload: JSON.stringify({
         status: novoStatus
-      }),
-      muteHttpExceptions: true
+      })
     };
 
     try {
       console.log(`🔄 Atualizando subtask ${subtaskId} para status "${novoStatus}"...`);
-      const response = UrlFetchApp.fetch(url, options);
+      const response = cuFetch_("cu-status", url, options);
       const code = response.getResponseCode();
 
       if (code === 200 || code === 204) {
+        markClickUpPatched();
         console.log(`   ✅ Status atualizado para "${novoStatus}"`);
         return true;
       } else {
@@ -1277,31 +1277,25 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
   function atualizarStatusEmBatch(updates) {
     if (!updates || updates.length === 0) return;
 
-    const requests = updates.map(u => ({
-      url: `https://api.clickup.com/api/v2/task/${u.subtaskId}`,
-      method: "PUT",
-      headers: {
-        "Authorization": CLICKUP_TOKEN,
-        "Content-Type": "application/json"
-      },
-      payload: JSON.stringify({ status: u.novoStatus }),
-      muteHttpExceptions: true
-    }));
-
     try {
-      const responses = UrlFetchApp.fetchAll(requests);
-
-      responses.forEach((response, idx) => {
-        const update = updates[idx];
-        if (response.getResponseCode() === 200) {
-          console.log(`   ✅ ${update.subtaskId} -> "${update.novoStatus}"`);
-          update.flatItem["clickup.subtaskStatus"] = update.novoStatus;
-          // Atualiza o objeto em memória para o cálculo final estar correto
-          if (update.subtaskInfo) {
-            update.subtaskInfo.status = update.novoStatus;
+      updates.forEach(update => {
+        try {
+          const response = cuFetch_("cu-status", `https://api.clickup.com/api/v2/task/${update.subtaskId}`, {
+            method: "PUT",
+            payload: JSON.stringify({ status: update.novoStatus })
+          });
+          if (response.getResponseCode() === 200) {
+            markClickUpPatched();
+            console.log(`   ✅ ${update.subtaskId} -> "${update.novoStatus}"`);
+            update.flatItem["clickup.subtaskStatus"] = update.novoStatus;
+            if (update.subtaskInfo) {
+              update.subtaskInfo.status = update.novoStatus;
+            }
+          } else {
+            console.warn(`   ⚠️ Erro ${update.subtaskId}: ${response.getResponseCode()}`);
           }
-        } else {
-          console.warn(`   ⚠️ Erro ${update.subtaskId}: ${response.getResponseCode()}`);
+        } catch (innerErr) {
+          console.error(`❌ Erro ao atualizar status ${update.subtaskId}: ${innerErr.message}`);
         }
       });
     } catch (e) {
@@ -1392,31 +1386,6 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     };
   }
 
-  function obterTokenJWT() {
-    const cacheKey = "gm_token";
-    const cached = scriptCache.get(cacheKey);
-    if (cached) return cached;
-
-    try {
-      const resp = UrlFetchApp.fetch("https://3coracoes.greenmile.com/login", {
-        "method": "post",
-        "payload": `j_username=${encodeURIComponent(GM_USERNAME)}&j_password=${encodeURIComponent(GM_PASSWORD)}`,
-        "headers": { "Accept": "application/json", "Greenmile-Module": "LIVE" },
-        "muteHttpExceptions": true
-      });
-
-      if (resp.getResponseCode() === 200) {
-        let j = JSON.parse(resp.getContentText());
-        const token = (j.analyticsToken && j.analyticsToken.access_token) ? j.analyticsToken.access_token : j.access_token;
-        if (token) {
-          scriptCache.put(cacheKey, token, CACHE_TTL_GM_TOKEN_SECONDS);
-        }
-        return token;
-      }
-    } catch (e) { console.error("Erro Auth GM: " + e.message); }
-    return null;
-  }
-
   function rotaConcluidaPorSubtasks(mapa) {
     if (!mapa || mapa.size === 0) return false;
     for (const valor of mapa.values()) {
@@ -1493,25 +1462,19 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
 
     const options = {
       method: "POST",
-      headers: {
-        "Authorization": CLICKUP_TOKEN,
-        "Content-Type": "application/json"
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
+      payload: JSON.stringify(payload)
     };
     const url = `https://api.clickup.com/api/v2/team/${teamId}/time_entries/start`;
     try {
       console.log(`🕒 Iniciando cronômetro "No Cliente" para ${taskId}${descricao ? ` (${descricao})` : ""}...`);
-      const response = UrlFetchApp.fetch(url, options);
-      const code = response.getResponseCode();
-      const body = response.getContentText();
-      if (code === 200 || code === 201 || code === 204) {
-        scriptCache.put(cacheKey, "1", CACHE_TTL_TIMER_SECONDS);
-        console.log(`   ✅ Timer iniciado para ${taskId}`);
-        return true;
-      }
-      console.warn(`   ⚠️ Falha ao iniciar timer ${taskId}: ${code} - ${body}`);
+    const response = cuFetch_("cu-timer", url, options);
+    const code = response.getResponseCode();
+    if (code === 200 || code === 201 || code === 204) {
+      scriptCache.put(cacheKey, "1", CACHE_TTL_TIMER_SECONDS);
+      console.log(`   ✅ Timer iniciado para ${taskId}`);
+      return true;
+    }
+    console.warn(`   ⚠️ Falha ao iniciar timer ${taskId}: ${code} - ${response.getContentText()}`);
     } catch (e) {
       console.error(`   ❌ Erro ao iniciar timer ClickUp: ${e.message}`);
     }
@@ -1540,18 +1503,14 @@ function executarSincronizacaoGreenMile(taskIdFromWebhook) {
     const url = `https://api.clickup.com/api/v2/task/${taskId}`;
     const options = {
       method: "PUT",
-      headers: {
-        "Authorization": CLICKUP_TOKEN,
-        "Content-Type": "application/json"
-      },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
+      payload: JSON.stringify(payload)
     };
     try {
       console.log(`🔄 Atualizando task ${taskId} (${label})...`);
-      const response = UrlFetchApp.fetch(url, options);
+      const response = cuFetch_("cu-task", url, options);
       const code = response.getResponseCode();
       if (code === 200 || code === 204) {
+        markClickUpPatched();
         console.log(`   ✅ ${label} atualizado com sucesso`);
         return true;
       }
