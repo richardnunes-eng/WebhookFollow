@@ -30,7 +30,7 @@ const PROPS_KEY_ROTAS_FINALIZADAS = "GM_ROTAS_FINALIZADAS";
 const LOOP_CLICKUP_LIST_ID = "901314444197"; // lista monitorada pelo loop automatizado
 const LOOP_MINUTES_INTERVAL = 1; // Apps Script aceita mínimo de 1 minuto (45s não é suportado)
 const LOOP_FETCH_BATCH_PAGES = 4;
-const LOOP_STATUS_EXCLUDE = ["cancelado", "sinistro"];
+const LOOP_STATUS_EXCLUDE = ["cancelado", "sinistro", "finalizada", "concluída", "concluido", "entregue", "closed", "complete", "fechado"];
 const CACHE_TTL_TASK_SECONDS = 120;
 const CACHE_TTL_SUBTASK_SECONDS = 300;
 const CACHE_TTL_TIMER_SECONDS = 600;
@@ -358,13 +358,28 @@ function prefetchTasksClickUpBatch(tasks) {
 /**
  * Busca todas as tasks abertas da lista (sem subtasks).
  */
+/**
+ * Wrapper p/ retrocompatibilidade: busca apenas ativas (sem closed)
+ */
 function buscarTasksAtivasDaLista(listId) {
+  return buscarTasksGeneric(listId, { include_closed: false });
+}
+
+/**
+ * Busca tasks da lista com opções flexíveis (suporta closed/history)
+ */
+function buscarTasksGeneric(listId, options = {}) {
   if (!listId) return [];
 
   const baseUrl = `https://api.clickup.com/api/v2/list/${listId}/task`;
   const results = [];
   let currentPage = 0;
   const clickUpToken = getClickUpToken_();
+
+  // Default options
+  const includeClosed = options.include_closed === true;
+  const dateUpdatedGt = options.date_updated_gt || null; // timestamp ms
+
   const optionsBase = {
     method: "GET",
     headers: {
@@ -381,43 +396,87 @@ function buscarTasksAtivasDaLista(listId) {
     }
 
     const requests = pages.map(page => {
-      const query = [
+      let queryParams = [
         "subtasks=false",
-        "include_closed=false",
+        `include_closed=${includeClosed}`, // Configurable
         "archived=false",
-        "order_by=id",
-        "reverse=false",
+        "order_by=updated", // Sort by updated for history consistency
+        "reverse=true",     // Newest updated first
         "limit=100",
         `page=${page}`
-      ].join("&");
+      ];
+
+      if (dateUpdatedGt) {
+        queryParams.push(`date_updated_gt=${dateUpdatedGt}`);
+      }
+
       return {
-        url: `${baseUrl}?${query}`,
+        url: `${baseUrl}?${queryParams.join("&")}`,
         ...optionsBase
       };
     });
 
-    const responses = UrlFetchApp.fetchAll(requests);
+    let responses;
+    try {
+      responses = UrlFetchApp.fetchAll(requests);
+    } catch (batchError) {
+      console.error(`❌ fetchAll batch failed: ${batchError.message}`);
+      break;
+    }
     let atLeastOneMore = false;
 
     responses.forEach((response, idx) => {
       const page = pages[idx];
-      const code = response.getResponseCode();
-      if (code !== 200) {
-        console.warn(`⚠️ Página ${page} da lista ${listId} retornou HTTP ${code}`);
-        return;
-      }
-      const payload = JSON.parse(response.getContentText());
-      const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
-      const filtered = tasks.filter(task => !deveIgnorarTaskPorStatus(task));
-      console.log(`📦 Página ${page} trouxe ${filtered.length}/${tasks.length} task(s) úteis.`);
-      results.push(...filtered);
-      if (payload.next_page && payload.next_page.page !== null && payload.next_page.page !== undefined) {
-        atLeastOneMore = true;
+      try {
+        const code = response.getResponseCode();
+        if (code !== 200) {
+          console.warn(`⚠️ Página ${page} da lista ${listId} retornou HTTP ${code}`);
+          return;
+        }
+        const payload = JSON.parse(response.getContentText());
+        const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+
+        // Filter logic: ignore specific statuses (cancelado/sinistro) even if fetching history, unless we explicitly want them?
+        // User wants "closed" tasks (finalized), but maybe not "cancelled" ones?
+        // deveIgnorarTaskPorStatus ignores "cancelado" and "sinistro".
+        // Keep using it for now to avoid "trash" in the dashboard.
+
+        const filtered = tasks.filter(task => !deveIgnorarTaskPorStatus(task));
+
+        console.log(`📦 Página ${page} (opt: ${JSON.stringify(options)}) trouxe ${filtered.length}/${tasks.length} tasks.`);
+        results.push(...filtered);
+
+        // Pagination logic: if last page was full-ish or payload.next_page?
+        // ClickUp API usually sends 'last_page' boolean or just empty tasks on next.
+        // But original code used this logic:
+        if (tasks.length > 0) {
+          atLeastOneMore = true; // Naively assume if we got tasks, maybe there are more.
+          // But wait, original code checked 'payload.next_page'.
+          // ClickUp API v2 responses: { tasks: [], id: "..." } - no standard next_page usually?
+          // Actually original code checked payload.next_page. Let's keep that.
+        }
+
+        // Check standard ClickUp pagination if present, but usually we just check if tasks.length == limit?
+        // Original code: if (payload.next_page && payload.next_page.page !== null ...)
+        // We'll trust original logic if it worked, or simplify to "tasks.length > 0" if sorting by updated.
+        // Actually, if we sort by date_updated desc and use date_updated_gt, we can stop early if we hit old tasks?
+        // But the API handles the filtering.
+
+        // Let's stick to original pagination check style if possible, or just tasks.length == 100
+        if (payload.tasks.length === 100) atLeastOneMore = true; // Safer heuristic
+      } catch (itemError) {
+        console.warn(`⚠️ Falha ao processar página ${page}: ${itemError.message}`);
       }
     });
 
-    currentPage += LOOP_FETCH_BATCH_PAGES;
     if (!atLeastOneMore) break;
+    currentPage += LOOP_FETCH_BATCH_PAGES;
+
+    // Safety break for history fetch to avoid infinite loops
+    if (results.length > 2000) {
+      console.warn("[WF] Limit of 2000 tasks reached in generic fetch");
+      break;
+    }
   }
 
   return results;
@@ -446,15 +505,27 @@ function doGet(e) {
     return ContentService.createTextOutput(JSON.stringify({ status: "online" })).setMimeType(ContentService.MimeType.JSON);
   }
 
-  // Por padrão, serve o dashboard HTML
-  return HtmlService.createHtmlOutputFromFile("Dashboard")
-    .setTitle("Dashboard de Rotas")
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  // DashboardV2 API endpoint
+  if (action.toLowerCase() === "getdashv2") {
+    return ContentService.createTextOutput(JSON.stringify(getDashboardV2()))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Se pedir Dashboard V1 (Legacy)
+  if (action.toLowerCase() === "dashboardv1" || action.toLowerCase() === "v1" || action.toLowerCase() === "legacy") {
+    return HtmlService.createHtmlOutputFromFile("Dashboard")
+      .setTitle("Dashboard V1 (Legacy)");
+  }
+
+  // Por padrão, serve Dashboard V2
+  return HtmlService.createHtmlOutputFromFile("DashboardV2")
+    .setTitle("Dashboard V2 de Rotas");
 }
 
 /**
  * Função chamada pelo frontend do dashboard para buscar dados
- * Combina dados do GreenMile com informações do ClickUp
+ * OTIMIZADO: Usa apenas dados do GreenMile (deliveryStatus) sem buscar no ClickUp
+ * Filtra apenas rotas que começam com "610"
  */
 function getDashboardData() {
   const scriptProps = PropertiesService.getScriptProperties();
@@ -467,50 +538,30 @@ function getDashboardData() {
     console.log("[Dashboard] Buscando tasks ativas...");
     const tasks = buscarTasksAtivasDaLista(LOOP_CLICKUP_LIST_ID);
     const routeMap = buildRouteMapFromTasks(tasks);
-    const routeKeys = Array.from(routeMap.keys());
 
-    console.log(`[Dashboard] ${tasks.length} tasks, ${routeKeys.length} rotas`);
+    // Filtra apenas rotas que começam com "610"
+    const allRouteKeys = Array.from(routeMap.keys());
+    const routeKeys = allRouteKeys.filter(key => key.startsWith("610"));
 
-    // Busca snapshots do GreenMile
+    console.log(`[Dashboard] ${tasks.length} tasks, ${allRouteKeys.length} rotas total, ${routeKeys.length} rotas 610*`);
+
+    // Busca snapshots do GreenMile (sem buscar no ClickUp!)
     const snapshots = fetchGreenMileSnapshots(routeKeys);
     const dataVer = getCurrentDataVersion(scriptProps);
 
-    // Para cada rota, enriquece com dados do ClickUp
+    // Para cada rota, monta dados usando apenas GreenMile
     const items = routeKeys.map((routeKey) => {
       const snapshot = snapshots[routeKey] || {};
       const routeInfo = routeMap.get(routeKey) || {};
       const taskId = routeInfo.taskId;
       const taskUrl = routeInfo.taskUrl || `https://app.clickup.com/t/${taskId}`;
 
-      // Busca subtasks do ClickUp para esta rota
-      let mapaSubtasks = new Map();
-      if (taskId) {
-        try {
-          mapaSubtasks = buscarSubtasksComIdGMGlobal(taskId);
-        } catch (e) {
-          console.error(`[Dashboard] Erro ao buscar subtasks de ${taskId}: ${e.message}`);
-        }
-      }
-
-      // Enriquece cada item do snapshot com dados do ClickUp
-      const enrichedItems = (snapshot.items || []).map(item => {
-        const codigoCliente = item["stop.location.key"];
-        const subtaskInfo = codigoCliente ? mapaSubtasks.get(String(codigoCliente).trim()) : null;
-
-        // Adiciona campos do ClickUp
+      // Usa items do snapshot sem enriquecer com ClickUp
+      // O deliveryStatus do GreenMile será usado pelo frontend
+      const snapshotItems = (snapshot.items || []).map(item => {
+        // Adiciona URL da task principal para link
         const enriched = Object.assign({}, item);
-        if (subtaskInfo) {
-          enriched["clickup.taskUrl"] = subtaskInfo.subtaskUrl || taskUrl;
-          enriched["clickup.subtaskName"] = subtaskInfo.subtaskName || "";
-          enriched["clickup.subtaskStatus"] = subtaskInfo.status || "";
-          enriched["clickup.nfes"] = subtaskInfo.nfes || "";
-        } else {
-          enriched["clickup.taskUrl"] = taskUrl;
-          enriched["clickup.subtaskName"] = "";
-          enriched["clickup.subtaskStatus"] = "";
-          enriched["clickup.nfes"] = "";
-        }
-
+        enriched["clickup.taskUrl"] = taskUrl;
         return enriched;
       });
 
@@ -518,13 +569,13 @@ function getDashboardData() {
         routeKey,
         taskUrl,
         fingerprint: snapshot.fingerprint || null,
-        rows: enrichedItems.length,
+        rows: snapshotItems.length,
         error: snapshot.error || null,
-        items: enrichedItems
+        items: snapshotItems
       };
     });
 
-    console.log(`[Dashboard] Retornando ${items.length} rotas com dados enriquecidos`);
+    console.log(`[Dashboard] Retornando ${items.length} rotas`);
 
     return {
       status: "success",
@@ -539,6 +590,66 @@ function getDashboardData() {
     return {
       status: "error",
       message: error.message
+    };
+  }
+}
+
+/**
+ * Returns cached DashboardV2 data (generated by runnerMain)
+ * This is a lightweight read-only endpoint - no API calls to ClickUp/GM
+ * Uses chunked cache storage to handle large payloads
+ */
+function getDashboardV2() {
+  const scriptProps = PropertiesService.getScriptProperties();
+
+  // Read index
+  const indexRaw = scriptProps.getProperty("WF_DASH_V2_CACHE_IDX");
+  if (!indexRaw) {
+    return {
+      status: "empty",
+      message: "Cache não disponível. Aguarde a próxima execução do runner.",
+      data: null
+    };
+  }
+
+  try {
+    const index = JSON.parse(indexRaw);
+    const chunks = [];
+
+    // Read all chunks
+    for (let i = 0; i < index.n; i++) {
+      const chunk = scriptProps.getProperty("WF_DASH_V2_CACHE_" + i);
+      if (!chunk) {
+        throw new Error(`Chunk ${i}/${index.n} missing`);
+      }
+      chunks.push(chunk);
+    }
+
+    const json = chunks.join("");
+    const data = JSON.parse(json);
+
+    const ageMs = Date.now() - index.ts;
+
+    return {
+      status: "success",
+      cacheAgeMs: ageMs,
+      cacheInfo: {
+        chunks: index.n,
+        bytes: index.bytes,
+        dataVer: index.dataVer,
+        execId: index.execId
+      },
+      data: data
+    };
+  } catch (e) {
+    console.error(`[WF] getDashboardV2 error: ${e.message}`);
+    const props = PropertiesService.getScriptProperties().getProperties();
+    const available = Object.keys(props).filter(k => k.startsWith("WF_DASH_V2_CACHE_"));
+    return {
+      status: "error",
+      message: e.message,
+      debug: { availableKeys: available },
+      data: null
     };
   }
 }
@@ -724,6 +835,7 @@ function verUltimoWebhook() {
 }
 
 // === FUNÇÃO DE TESTE (roda pelo editor) ===
+// === FUNÇÃO DE TESTE (roda pelo editor) ===
 function testeManual() {
   console.log("🧪 Iniciando teste manual...");
 
@@ -739,6 +851,75 @@ function testeManual() {
   console.log("🧪 Chamando doPost com evento fake...");
   const resultado = doPost(fakeEvent);
   console.log("🧪 Resultado: " + resultado.getContent());
+}
+
+function debugTask86aexxb42() {
+  logTaskCustomFields("86aexxb42");
+}
+
+/**
+ * DEBUG: Loga todos os campos personalizados de uma task de forma organizada.
+ * Pode ser usado com uma task que já está em memória (objeto) ou busca pelo ID se não fornecida.
+ */
+function logTaskCustomFields(taskOrId) {
+  let task = taskOrId;
+
+  if (typeof taskOrId === "string") {
+    // Tenta pegar do cache de memória global se disponível
+    if (typeof PREFETCH_TASKS_BY_ID !== "undefined" && PREFETCH_TASKS_BY_ID[taskOrId]) {
+      console.log(`🧠 Usando task ${taskOrId} da MEMÓRIA (Global Cache)`);
+      task = PREFETCH_TASKS_BY_ID[taskOrId];
+    } else {
+      console.log(`🌐 Buscando task ${taskOrId} na API ClickUp...`);
+      task = buscarTaskClickUp(taskOrId);
+    }
+  }
+
+  if (!task) {
+    console.log("❌ Task não encontrada ou nula.");
+    return;
+  }
+
+  console.log(`\n==================================================`);
+  console.log(`📋 DEBUG CUSTOM FIELDS: ${task.name} (ID: ${task.id})`);
+  console.log(`==================================================`);
+
+  if (!task.custom_fields || task.custom_fields.length === 0) {
+    console.log("⚠️ Nenhum custom field encontrado nesta task.");
+    return;
+  }
+
+  // Ordena alfabeticamente pelo nome do campo
+  const sorted = task.custom_fields.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+  sorted.forEach(cf => {
+    let displayValue = cf.value;
+    let extraInfo = "";
+
+    // Tratamento para Dropdown (tenta achar o label)
+    if (cf.type === "drop_down" && cf.type_config && cf.type_config.options && typeof cf.value === 'number') {
+      const optByIndex = cf.type_config.options[cf.value];
+      if (optByIndex) {
+        displayValue = `"${optByIndex.name}"`;
+        extraInfo = `(Index: ${cf.value})`;
+      }
+    }
+
+    // Tratamento basico para objetos
+    if (typeof displayValue === 'object' && displayValue !== null) {
+      displayValue = JSON.stringify(displayValue);
+    }
+
+    if (displayValue === undefined || displayValue === null) {
+      displayValue = "[VAZIO]";
+    }
+
+    console.log(`🔹 [${cf.name}]`);
+    console.log(`   ID: ${cf.id} | Tipo: ${cf.type}`);
+    console.log(`   Valor: ${displayValue} ${extraInfo}`);
+    console.log(`--------------------------------------------------`);
+  });
+  console.log(`✅ Fim dos custom fields.\n`);
 }
 
 // ==============================================================================

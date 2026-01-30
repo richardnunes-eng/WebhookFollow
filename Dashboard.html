@@ -1375,11 +1375,29 @@
             renderTable(filtered);
         }
 
+        // ===== Polling State =====
+        var pollingState = {
+            inFlight: false,
+            intervalId: null,
+            baseInterval: 120000,    // 120s when idle
+            activeInterval: 30000,   // 30s when user active
+            idleTimeout: null,
+            isUserActive: true
+        };
+
         // ===== API (via google.script.run) =====
         function fetchData() {
+            // In-flight guard: prevent overlapping requests
+            if (pollingState.inFlight) {
+                console.log('[Dashboard] Request already in flight, skipping...');
+                return;
+            }
+            pollingState.inFlight = true;
             DOM.btnRefresh.classList.add('loading');
+
             google.script.run
                 .withSuccessHandler(function (result) {
+                    pollingState.inFlight = false;
                     DOM.btnRefresh.classList.remove('loading');
                     DOM.loadingOverlay.classList.add('hidden');
                     if (result && result.data) {
@@ -1397,6 +1415,7 @@
                     }
                 })
                 .withFailureHandler(function (err) {
+                    pollingState.inFlight = false;
                     DOM.btnRefresh.classList.remove('loading');
                     DOM.loadingOverlay.classList.add('hidden');
                     showToast('Erro: ' + err.message, 'error');
@@ -1410,6 +1429,41 @@
             toast.textContent = message;
             DOM.toastContainer.appendChild(toast);
             setTimeout(function () { toast.remove(); }, 4000);
+        }
+
+        // ===== Polling Control =====
+        function startPolling() {
+            if (pollingState.intervalId) {
+                clearInterval(pollingState.intervalId);
+            }
+            var interval = pollingState.isUserActive
+                ? pollingState.activeInterval
+                : pollingState.baseInterval;
+            pollingState.intervalId = setInterval(fetchData, interval);
+        }
+
+        function handleVisibilityChange() {
+            if (document.hidden) {
+                // Tab hidden: stop polling
+                if (pollingState.intervalId) {
+                    clearInterval(pollingState.intervalId);
+                    pollingState.intervalId = null;
+                }
+            } else {
+                // Tab visible: fetch immediately and restart polling
+                fetchData();
+                startPolling();
+            }
+        }
+
+        function resetIdleTimer() {
+            pollingState.isUserActive = true;
+            // Only restart polling if interval changed
+            if (pollingState.idleTimeout) clearTimeout(pollingState.idleTimeout);
+            pollingState.idleTimeout = setTimeout(function () {
+                pollingState.isUserActive = false;
+                startPolling(); // Restart with longer interval
+            }, 120000); // 2 min inactivity -> idle
         }
 
         // ===== Event Listeners =====
@@ -1447,12 +1501,21 @@
                     }
                 });
             });
+
+            // Visibility API: pause polling when tab hidden
+            document.addEventListener('visibilitychange', handleVisibilityChange);
+
+            // Idle detection: track user activity
+            ['mousemove', 'keydown', 'click', 'scroll', 'touchstart'].forEach(function (evt) {
+                document.addEventListener(evt, resetIdleTimer, { passive: true });
+            });
         }
 
         // ===== Init =====
         setupEventListeners();
         fetchData();
-        setInterval(fetchData, 30000);
+        startPolling();
+        resetIdleTimer();
     </script>
 </body>
 
