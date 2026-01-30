@@ -1,0 +1,7 @@
+# Ignorar arquivos do dashboard (funciona apenas no navegador)
+dashboard/**
+dashboard/
+
+# Outros arquivos que não são do Apps Script
+*.md
+.git/**

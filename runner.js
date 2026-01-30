@@ -16,6 +16,8 @@ const MAX_LOG_BODY_LENGTH = 2000;
 const GM_LOGIN_URL = "https://3coracoes.greenmile.com/login";
 
 const RUNNER_OPERATIONAL_WINDOW = { startHour: 6, endHour: 19 };
+const RUNNER_DURACAO_MINUTOS_NO_CLIENTE = 30;
+const RUNNER_REENTREGA_STATUS = "Reentrega";
 
 const MODE_BATCH_WEBHOOK = "BATCH_WEBHOOK";
 const MODE_LEGACY = "LEGACY";
@@ -27,6 +29,10 @@ const SITE_WEBHOOK_MODE_KEY = "SITE_WEBHOOK_MODE";
 const SITE_WEBHOOK_MODE_DELTA = "delta";
 const SITE_WEBHOOK_MODE_PULL = "pull";
 const VOLATILE_FIELD_PATTERNS = ["lastupdated", "updated", "created", "timestamp", "now"];
+const RUNNER_STATUS_FINAL_KEYWORDS = ["finalizada", "done", "complete", "entregue", "retorno", "delivered"];
+
+
+
 
 const DEFAULT_CLICKUP_TOKEN = typeof CLICKUP_TOKEN === "undefined" ? "" : CLICKUP_TOKEN;
 const DEFAULT_GM_USERNAME = typeof GM_USERNAME === "undefined" ? "" : GM_USERNAME;
@@ -83,6 +89,20 @@ function processRunnerTasks(scriptProps, telemetry) {
   const tasks = buscarTasksAtivasDaLista(LOOP_CLICKUP_LIST_ID);
   telemetry.counters.plansTotal = tasks.length;
   telemetry.counters.plansChecked = 0;
+
+  if (tasks.length > 0 && typeof prefetchTasksClickUpBatch === "function") {
+    prefetchTasksClickUpBatch(tasks);
+  }
+
+  tasks.forEach((task) => {
+    if (!task || !task.id) return;
+    try {
+      const routeKey = extractRouteKey(task) || "";
+      reconciliarStatusTaskPrincipal(task.id, null, routeKey);
+    } catch (error) {
+      console.error(`[WF][${telemetry.execId}] reconcile ${task.id} falhou: ${error.message}`);
+    }
+  });
 
   const cursor = loadClickUpCursor(scriptProps);
   let maxCreatedAt = cursor.lastCreatedAt || 0;
@@ -143,6 +163,10 @@ function processBatchRunnerTasks(scriptProps, telemetry) {
   const routeKeys = Array.from(routeMap.keys());
   telemetry.counters.checkedRoutes = routeKeys.length;
 
+  if (tasks.length > 0 && typeof prefetchTasksClickUpBatch === "function") {
+    prefetchTasksClickUpBatch(tasks);
+  }
+
   console.log(`[WF][${telemetry.execId}] batch checking ${routeKeys.length} rota(s)`);
 
   if (routeKeys.length === 0) {
@@ -168,8 +192,43 @@ function processBatchRunnerTasks(scriptProps, telemetry) {
 
   telemetry.counters.changedRoutes = changedCandidates.length;
 
+  // Identify Pure Reentrega Tasks (No Route Key or Non-610)
+  const pureReentregaTasks = [];
+  tasks.forEach((task) => {
+    if (!task || !task.id) return;
+    const rKey = extractRouteKey(task);
+    if (!rKey || !String(rKey).startsWith("610")) {
+      pureReentregaTasks.push(task);
+    }
+  });
+
+  if (pureReentregaTasks.length > 0) {
+    console.log(`[WF][${telemetry.execId}] processando ${pureReentregaTasks.length} rotas de reentrega pura...`);
+    pureReentregaTasks.forEach(task => {
+      try {
+        // Force full sync for pure reentrega to apply status/NFes logic
+        sincronizarGreenMileStable(task.id, true);
+        incrementTelemetryCounter("clickUpPatched"); // Count as patched
+      } catch (e) {
+        console.error(`[WF][${telemetry.execId}] erro ao sincronizar reentrega pura ${task.id}: ${e.message}`);
+        incrementTelemetryCounter("cuErrors");
+      }
+    });
+  }
+
+  tasks.forEach((task) => {
+    if (!task || !task.id) return;
+    try {
+      const routeKey = extractRouteKey(task) || "";
+      const snapshot = routeKey ? snapshots[routeKey] : null;
+      reconciliarStatusTaskPrincipal(task.id, snapshot || null, routeKey);
+    } catch (error) {
+      console.error(`[WF][${telemetry.execId}] reconcile ${task.id} falhou: ${error.message}`);
+    }
+  });
+
   if (changedCandidates.length === 0) {
-    console.log(`[WF][${telemetry.execId}] nenhuma mudança detectada.`);
+    console.log(`[WF][${telemetry.execId}] nenhuma mudança detectada (GM).`);
     maybeSendHeartbeat(scriptProps, telemetry);
     return;
   }
@@ -235,10 +294,12 @@ function buildRouteMapFromTasks(tasks) {
     existing.taskIds.push(task.id);
     existing.taskId = existing.taskId || task.id;
     existing.taskName = task.name || existing.taskName;
+    existing.taskUrl = existing.taskUrl || task.url || `https://app.clickup.com/t/${task.id}`;
     map.set(trimmed, existing);
   });
   return map;
 }
+
 
 function createTelemetry() {
   const startTs = Date.now();
@@ -633,6 +694,400 @@ function cuFetch_(where, url, options) {
   return finalResponse;
 }
 
+function cuFetchBatch_(where, requests) {
+  if (!Array.isArray(requests)) {
+    throw new Error("cuFetchBatch_ precisa de um array de requests.");
+  }
+  const token = getClickUpToken_();
+  const sanitized = requests.map((request) => {
+    const cloned = Object.assign({}, request);
+    cloned.muteHttpExceptions = true;
+    cloned.headers = Object.assign({ Authorization: token, "Content-Type": "application/json" }, cloned.headers || {});
+    return cloned;
+  });
+  const responses = UrlFetchApp.fetchAll(sanitized);
+  responses.forEach((response, index) => {
+    const logUrl = sanitized[index].url;
+    logHttpResponse(where, logUrl, response, "cuErrors");
+  });
+  return responses;
+}
+
+function buscarTaskClickUpParaReconciliar(taskId) {
+  if (!taskId) return null;
+  const cache = CacheService.getScriptCache();
+  const cacheKey = `cu_task_${taskId}`;
+  try {
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+  } catch (e) { }
+
+  const url = `https://api.clickup.com/api/v2/task/${taskId}?include_subtasks=true`;
+  const response = cuFetch_("cu-task", url, { method: "GET" });
+  const code = response.getResponseCode();
+  if (code !== 200 && code !== 204) {
+    console.warn(`[WF] reconcile task ${taskId} HTTP ${code}`);
+    return null;
+  }
+  try {
+    const json = JSON.parse(response.getContentText());
+    try { cache.put(cacheKey, JSON.stringify(json), 120); } catch (e) { }
+    return json;
+  } catch (e) {
+    console.warn(`[WF] reconcile parse task ${taskId}: ${e.message}`);
+
+    return null;
+  }
+}
+
+
+
+function updateTaskChecklistProgress(taskId, subtasksDetalhes) {
+  if (!taskId || !Array.isArray(subtasksDetalhes) || subtasksDetalhes.length === 0) return;
+
+  // Filtra apenas subtasks "relevantes" (ex: entregas reais)
+  // Se quiser incluir todas, basta remover o filtro ou ajustar.
+  // Aqui assumimos que todas as subtasks com ID GM são entregas.
+  const relevantSubtasks = subtasksDetalhes.filter(st => {
+    // Opcional: filtrar apenas as que têm ID GM se quiser ignorar manuais
+    // const idGM = extrairIdGM(st);
+    // return !!idGM;
+    return true;
+  });
+
+  if (relevantSubtasks.length === 0) return;
+
+  const checklistName = "Progresso Automático";
+  const checklist = ensureChecklistExists(taskId, checklistName);
+
+  if (!checklist || !checklist.id) {
+    console.warn(`[WF] Falha ao obter/criar checklist "${checklistName}" na task ${taskId}`);
+    return;
+  }
+
+  // Mapeia itens existentes para não duplicar (busca por nome)
+  const existingItemsMap = new Map();
+  if (Array.isArray(checklist.items)) {
+    checklist.items.forEach(item => existingItemsMap.set(item.name.trim(), item));
+  }
+
+  relevantSubtasks.forEach(subtask => {
+    const itemName = subtask.name.trim(); // Nome do item = Nome da Subtask
+    const statusText = subtask.status ? subtask.status.status : "";
+
+    // É finalizado SE for status final E NÃO CONTIVER "retorno" ou "reentrega"
+    const isFinished = isStatusFinal(statusText) &&
+      !statusText.toLowerCase().includes("retorno") &&
+      !statusText.toLowerCase().includes("reentrega");
+
+    console.log(`[WF] Checklist Check: "${itemName}" | Status: "${statusText}" | Finished? ${isFinished}`);
+
+    const existingItem = existingItemsMap.get(itemName);
+
+    if (existingItem) {
+      if (existingItem.resolved !== isFinished) {
+        updateChecklistItem(checklist.id, existingItem.id, isFinished);
+      }
+    } else {
+      createChecklistItem(checklist.id, itemName, isFinished);
+    }
+  });
+}
+
+
+
+
+
+function isStatusFinal(status) {
+  if (!status) return false;
+  const lower = status.toLowerCase();
+  return RUNNER_STATUS_FINAL_KEYWORDS.some(k => lower.includes(k));
+}
+
+function reconciliarStatusTaskPrincipal(taskId, snapshot, routeKey) {
+  if (!taskId) return false;
+  const task = buscarTaskClickUpParaReconciliar(taskId);
+  if (!task) return false;
+  const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+  if (subtasks.length === 0) return false;
+
+  const statusAtual = task.status ? task.status.status : "";
+  const lowerAtual = String(statusAtual || "").toLowerCase();
+  let temNoCliente = false;
+  let temCritico = false;
+  let todosFinalizados = true;
+
+  subtasks.forEach((sub) => {
+    const st = String((sub.status && sub.status.status) || sub.status || "").toLowerCase();
+    if (st.includes("no cliente")) temNoCliente = true;
+    if (st.includes("critico") || st.includes("crítico")) temCritico = true;
+    if (!RUNNER_STATUS_FINAL_KEYWORDS.some((kw) => st.includes(kw))) {
+      todosFinalizados = false;
+    }
+  });
+
+  let statusEsperado = null;
+  const gmRows = snapshot && Array.isArray(snapshot.items) ? snapshot.items : [];
+  if (snapshot && snapshot.error) {
+    return false;
+  }
+  const rotaNaoGM = !routeKey || !String(routeKey).startsWith("610");
+  if (rotaNaoGM) {
+    aplicarReentregaSemGreenMile(task);
+    statusEsperado = RUNNER_REENTREGA_STATUS;
+  } else if (snapshot && gmRows.length === 0) {
+    // Para rotas 610, não forçar "Reentrega" aqui. A decisão fica com o fluxo GM (Código.js).
+    return false;
+  } else {
+    let gmNoCliente = false;
+    let gmCritico = false;
+    gmRows.forEach((row) => {
+      const arrival = row["stop.actualArrival"];
+      const departure = row["stop.actualDeparture"];
+      if (temHorario(arrival) && !temHorario(departure)) {
+        const arrivalMs = parseHorarioMs(arrival);
+        if (arrivalMs && arrivalMs + RUNNER_DURACAO_MINUTOS_NO_CLIENTE * 60000 < Date.now()) {
+          gmCritico = true;
+        } else {
+          gmNoCliente = true;
+        }
+      }
+    });
+
+    if (gmCritico || temCritico) {
+      statusEsperado = "Crítico";
+    } else if (gmNoCliente || temNoCliente) {
+      statusEsperado = "No Cliente";
+    } else if (todosFinalizados) {
+      statusEsperado = "Validar Finalização";
+    } else {
+      statusEsperado = "Em rota";
+    }
+  }
+
+  if (!statusEsperado) return false;
+  if (lowerAtual === statusEsperado.toLowerCase()) return false;
+
+  console.log(`🔁 Reconciliando status da task ${taskId}: "${statusAtual}" -> "${statusEsperado}"`);
+  return atualizarTaskClickUpRunner(taskId, { status: statusEsperado }, `status "${statusEsperado}"`);
+}
+
+function temHorario(valor) {
+  if (valor === null || valor === undefined) return false;
+  if (valor instanceof Date) return true;
+  if (typeof valor === "number") return true;
+  return String(valor).trim().length > 0;
+}
+
+function parseHorarioMs(valor) {
+  if (!valor) return null;
+  if (valor instanceof Date) return valor.getTime();
+  if (typeof valor === "number") return valor;
+  const date = new Date(valor);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.getTime();
+}
+
+function aplicarReentregaSemGreenMile(task) {
+  if (!task || !task.id) return;
+  const taskId = task.id;
+  const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+  if (subtasks.length === 0) return;
+
+  const subtasksDetalhes = buscarSubtasksDetalhes(subtasks.map(st => st.id));
+  const nfesPorSubtask = [];
+  const updatesStatus = [];
+
+  subtasksDetalhes.forEach((subtask) => {
+    if (!subtask || !subtask.id) return;
+
+    // Se tem ID GM, normalmente seria uma subtask "normal" de entrega.
+    // Mas se estamos em "aplicarReentregaSemGreenMile" (chamado quando rotaNaoGM == true),
+    // então presumimos que é uma reentrega manual/pura ou cópia de task antiga.
+    // Portanto, IGNORAMOS o fato de ter idGM e forçamos Reentrega.
+    const idGM = extrairIdGM(subtask);
+    if (idGM) {
+      // Apenas loga para debug, mas NÃO retorna.
+      // console.log(`[WF] Subtask ${subtask.id} tem ID GM (${idGM}) mas será tratada como Reentrega (Sem GM).`);
+    }
+
+    const nfChecklist = extrairNfesChecklist(subtask);
+    const { fieldId, fieldValue } = extrairCampoNfe(subtask);
+    const mergedNfes = mergeNfes(fieldValue, nfChecklist);
+
+    if (mergedNfes) {
+      nfesPorSubtask.push(mergedNfes);
+      if (fieldId && precisaAtualizarCampo(fieldValue, mergedNfes)) {
+        atualizarCampoPersonalizadoClickUpRunner(subtask.id, fieldId, mergedNfes);
+      }
+    }
+
+    updatesStatus.push({ subtaskId: subtask.id, novoStatus: RUNNER_REENTREGA_STATUS });
+  });
+
+  if (updatesStatus.length > 0) {
+    atualizarStatusSubtasksBatch(updatesStatus);
+  }
+
+  const mergedTaskNfes = mergeNfes("", nfesPorSubtask.join(", "));
+  if (mergedTaskNfes) {
+    const { fieldId: fieldIdTask, fieldValue: fieldValueTask } = extrairCampoNfe(task);
+    if (fieldIdTask && precisaAtualizarCampo(fieldValueTask, mergedTaskNfes)) {
+      atualizarCampoPersonalizadoClickUpRunner(taskId, fieldIdTask, mergedTaskNfes);
+    }
+  }
+}
+
+function extrairIdGM(task) {
+  if (task && Array.isArray(task.custom_fields)) {
+    const campo = task.custom_fields.find(cf =>
+      cf.name && cf.name.includes("ID GM Localização")
+    );
+    if (campo && campo.value) {
+      return String(campo.value).trim();
+    }
+  }
+  return null;
+}
+
+function buscarSubtasksDetalhes(subtaskIds) {
+  if (!Array.isArray(subtaskIds) || subtaskIds.length === 0) return [];
+  const requests = subtaskIds.map((id) => ({
+    url: `https://api.clickup.com/api/v2/task/${id}`,
+    method: "GET"
+  }));
+  const responses = cuFetchBatch_("cu-subtask", requests);
+  const result = [];
+  responses.forEach((response) => {
+    if (response.getResponseCode() !== 200) return;
+    try {
+      result.push(JSON.parse(response.getContentText()));
+    } catch (e) { }
+  });
+  return result;
+}
+
+function extrairCampoNfe(task) {
+  let fieldId = null;
+  let fieldValue = "";
+  if (task && Array.isArray(task.custom_fields)) {
+    const campoNF = task.custom_fields.find(cf =>
+      cf.name && (/notas? fiscais/i.test(cf.name) || /nfe/i.test(cf.name))
+    );
+    if (campoNF) {
+      fieldId = campoNF.id;
+      if (campoNF.value !== undefined && campoNF.value !== null) {
+        fieldValue = String(campoNF.value).trim();
+      }
+    }
+  }
+  return { fieldId, fieldValue };
+}
+
+function extrairNfesChecklist(task) {
+  if (!task || !Array.isArray(task.checklists)) return "";
+  const itens = [];
+  task.checklists.forEach((checklist) => {
+    if (checklist.items && Array.isArray(checklist.items)) {
+      checklist.items.forEach((item) => {
+        if (item.name) itens.push(item.name.trim());
+      });
+    }
+  });
+  return itens.join(", ");
+}
+
+function mergeNfes(valorAtual, valorChecklist) {
+  const set = new Set();
+  [valorAtual, valorChecklist].forEach((valor) => {
+    if (!valor) return;
+    String(valor).split(",").forEach((parte) => {
+      const item = String(parte).trim();
+      if (item) set.add(item);
+    });
+  });
+  return Array.from(set).join(", ");
+}
+
+function precisaAtualizarCampo(valorAtual, valorNovo) {
+  if (!valorNovo) return false;
+  if (!valorAtual) return true;
+  const atualSet = new Set(String(valorAtual).split(",").map(v => v.trim()).filter(Boolean));
+  const novoSet = new Set(String(valorNovo).split(",").map(v => v.trim()).filter(Boolean));
+  if (novoSet.size > atualSet.size) return true;
+  for (const item of novoSet) {
+    if (!atualSet.has(item)) return true;
+  }
+  return false;
+}
+
+function atualizarCampoPersonalizadoClickUpRunner(taskId, fieldId, valor) {
+  if (!taskId || !fieldId) return false;
+  const url = `https://api.clickup.com/api/v2/task/${taskId}/field/${fieldId}`;
+  const options = {
+    method: "POST",
+    payload: JSON.stringify({ value: valor })
+  };
+  try {
+    const response = cuFetch_("cu-field", url, options);
+    const code = response.getResponseCode();
+    if (code === 200 || code === 204) {
+      markClickUpPatched();
+      console.log(`   ✅ Campo personalizado atualizado (task ${taskId})`);
+      return true;
+    }
+    console.warn(`   ⚠️ Erro ao atualizar campo (task ${taskId}): ${code}`);
+  } catch (e) {
+    console.error(`   ❌ Erro ao atualizar campo (task ${taskId}): ${e.message}`);
+  }
+  return false;
+}
+
+function atualizarStatusSubtasksBatch(updates) {
+  if (!updates || updates.length === 0) return;
+  const requests = updates.map(update => ({
+    url: `https://api.clickup.com/api/v2/task/${update.subtaskId}`,
+    method: "PUT",
+    payload: JSON.stringify({ status: update.novoStatus })
+  }));
+  const responses = cuFetchBatch_("cu-status", requests);
+  responses.forEach((response, idx) => {
+    const update = updates[idx];
+    const code = response.getResponseCode();
+    if (code === 200 || code === 204) {
+      markClickUpPatched();
+      console.log(`   ✅ ${update.subtaskId} -> "${update.novoStatus}"`);
+    } else {
+      console.warn(`   ⚠️ Erro ${update.subtaskId}: ${code}`);
+    }
+  });
+}
+
+function atualizarTaskClickUpRunner(taskId, payload, label) {
+  if (!taskId || !payload) return false;
+  const url = `https://api.clickup.com/api/v2/task/${taskId}`;
+  const options = {
+    method: "PUT",
+    payload: JSON.stringify(payload)
+  };
+  try {
+    console.log(`🔄 Atualizando task ${taskId} (${label})...`);
+    const response = cuFetch_("cu-task", url, options);
+    const code = response.getResponseCode();
+    if (code === 200 || code === 204) {
+      markClickUpPatched();
+      console.log(`   ✅ ${label} atualizado com sucesso`);
+      return true;
+    }
+    console.warn(`   ⚠️ Erro ao atualizar task (${label}): ${code} - ${response.getContentText()}`);
+  } catch (e) {
+    console.error(`   ❌ Erro ao atualizar task (${label}): ${e.message}`);
+  }
+  return false;
+}
+
 function logHttpResponse(where, url, response, counterKey) {
   const code = response.getResponseCode();
   const body = sanitizeBody(response.getContentText());
@@ -738,3 +1193,6 @@ function validarIntegracoesLeves() {
     nextRunInWindow: operationalWindowOK
   };
 }
+
+
+

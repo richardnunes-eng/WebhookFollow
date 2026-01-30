@@ -13,6 +13,7 @@ WebhookFollow agora roda em lote: o runner coleta snapshots GreenMile para todas
 | `SITE_WEBHOOK_MODE` | `delta` (default) envia `changedRouteIds`; `pull` envia somente `dataVer` e o site chama `getSnapshot`. |
 | `SITE_WEBHOOK_HEARTBEAT` | `true` habilita webhook leve quando nada mudou. Default `false`. |
 | `MODE` | `BATCH_WEBHOOK` (default) usa o pipeline novo; `LEGACY` mantém o laço clássico que chamava `sincronizarGreenMileStable` para cada task. |
+| `REFRESH_GM_FIELD_ID` | ID do campo personalizado checkbox `💹 Atualizar GM`; o loop marca esse campo para disparar o webhook do ClickUp e o doPost limpa o checkbox ao terminar. |
 
 ## Execução em lote
 - O runner respeita `LockService`, evita concorrência e faz reschedule (45s ou 90s após erro).
@@ -20,6 +21,7 @@ WebhookFollow agora roda em lote: o runner coleta snapshots GreenMile para todas
 - Cada rota recebe objetos flatten (como `stop.plannedSequenceNum`, `stop.deliveryStatus`, `stop.location.key`) sem campos `clickup.*` e sem timestamps voláteis (`lastUpdatedAt`, `now`, `timestamp`, `createdAt`).
 - Fingerprints são persistidos em `WF_ROUTE_FP:<rota>` somente após `sincronizarGreenMileStable` concluir com sucesso.
 - Ao detectar mudanças, o runner incrementa `WF_BATCH_DATA_VERSION` e registra o summary em `WF_LAST_RUN_SUMMARY`.
+- O `executarLoopListaClickUp` atualiza apenas o checkbox `💹 Atualizar GM` (configurado por `REFRESH_GM_FIELD_ID`); o ClickUp dispara o webhook e é o `doPost` o responsável por baixar o GreenMile, aplicar mudanças, comentar e avisar o site.
 
 ## Modos do webhook
 ### Payload delta (default)
@@ -63,6 +65,12 @@ Nesse modo o webhook apenas sinaliza a mudança: o site deve chamar `getSnapshot
 
 ## Assinatura do webhook
 Quando `SITE_WEBHOOK_SECRET` estiver setado, cada payload chega com o cabeçalho `X-WF-Signature` (HMAC SHA-256 do body). Valide o cabeçalho usando o mesmo segredo antes de aceitar o update.
+
+## Comentários e chat no ClickUp
+O `doPost`, além de disparar o pipeline completo (`sincronizarGreenMileStable`), agora deixa um comentário na task com o resultado:
+1. Sucesso com mudanças – lista quantas subtasks foram patchadas e aponta as rotas com fingerprint alterado.
+2. Sem mudanças – informa que a task já estava alinhada e o checkbox é limpo para aguardar o próximo loop.
+3. Em paralelo, sempre que há mudança (ou heartbeat configurado) o webhook do site é disparado com `dataVer` atualizado.
 
 ## Endpoint `getSnapshot`
 O servidor pode chamar `getSnapshot` para puxar o snapshot completo (ou para rotas específicas) sempre que receber um webhook pull.
