@@ -31,7 +31,7 @@ const SITE_WEBHOOK_MODE_KEY = "SITE_WEBHOOK_MODE";
 const SITE_WEBHOOK_MODE_DELTA = "delta";
 const SITE_WEBHOOK_MODE_PULL = "pull";
 const VOLATILE_FIELD_PATTERNS = ["lastupdated", "updated", "created", "timestamp", "now"];
-const RUNNER_STATUS_FINAL_KEYWORDS = ["finalizada", "done", "complete", "entregue", "retorno", "delivered"];
+
 
 // ============================================================================
 // DASHBOARD V2 CACHE CONSTANTS
@@ -55,7 +55,9 @@ const CF_IDS = {
   PROGRESSO: null,
   OCORRENCIAS: null,
   SINISTRO: null,
-  PERNOITE: null
+  PERNOITE: null,
+  CHEGADA_CLIENTE: null,
+  SAIDA_CLIENTE: null
 };
 
 // Field name patterns for fallback matching (most specific first)
@@ -73,7 +75,9 @@ const CF_PATTERNS = {
   PROGRESSO: ["progresso de entregas automatic_progress", "progresso de entregas"],
   OCORRENCIAS: ["🔴 ocorrências", "ocorrências", "ocorrencia"],
   SINISTRO: ["sinistro"],
-  PERNOITE: ["pernoite"]
+  PERNOITE: ["pernoite"],
+  CHEGADA_CLIENTE: ["➡️ chegada no cliente", "chegada no cliente", "chegada do cliente"],
+  SAIDA_CLIENTE: ["⬅️ saída do cliente", "saída do cliente", "saida do cliente"]
 };
 
 
@@ -921,21 +925,28 @@ function updateTaskChecklistProgress(taskId, subtasksDetalhes) {
 
 
 
-function isStatusFinal(status) {
-  if (!status) return false;
-  const lower = status.toLowerCase();
-  return RUNNER_STATUS_FINAL_KEYWORDS.some(k => lower.includes(k));
-}
+
 
 function reconciliarStatusTaskPrincipal(taskId, snapshot, routeKey) {
   if (!taskId) return false;
   const task = buscarTaskClickUpParaReconciliar(taskId);
   if (!task) return false;
   const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
-  if (subtasks.length === 0) return false;
 
   const statusAtual = task.status ? task.status.status : "";
   const lowerAtual = String(statusAtual || "").toLowerCase();
+
+  // Para reentrega pura (não começa com 610), atualiza status mesmo sem subtasks
+  const rotaNaoGM = !routeKey || !String(routeKey).startsWith("610");
+  if (rotaNaoGM) {
+    if (!isStatusFinal(statusAtual) && lowerAtual !== "reentrega") {
+      console.log(`🔁 Reconciliando status da task ${taskId} (reentrega pura): "${statusAtual}" -> "${RUNNER_REENTREGA_STATUS}"`);
+      return atualizarTaskClickUpRunner(taskId, { status: RUNNER_REENTREGA_STATUS }, `status "${RUNNER_REENTREGA_STATUS}"`);
+    }
+    return false;
+  }
+
+  if (subtasks.length === 0) return false;
   let temNoCliente = false;
   let temCritico = false;
   let todosFinalizados = true;
@@ -944,7 +955,7 @@ function reconciliarStatusTaskPrincipal(taskId, snapshot, routeKey) {
     const st = String((sub.status && sub.status.status) || sub.status || "").toLowerCase();
     if (st.includes("no cliente")) temNoCliente = true;
     if (st.includes("critico") || st.includes("crítico")) temCritico = true;
-    if (!RUNNER_STATUS_FINAL_KEYWORDS.some((kw) => st.includes(kw))) {
+    if (!isStatusFinal(sub.status)) {
       todosFinalizados = false;
     }
   });
@@ -954,16 +965,12 @@ function reconciliarStatusTaskPrincipal(taskId, snapshot, routeKey) {
   if (snapshot && snapshot.error) {
     return false;
   }
-  const rotaNaoGM = !routeKey || !String(routeKey).startsWith("610");
-  if (rotaNaoGM) {
-    // aplicarReentregaSemGreenMile(task); // DISABLED: Causing all subtasks to become Reentrega
-    // statusEsperado = RUNNER_REENTREGA_STATUS; // check if we should even set the main task status?
-    // User complaint suggests we should STOP touching these tasks entirely.
-    return false;
-  } else if (snapshot && gmRows.length === 0) {
-    // Para rotas 610, não forçar "Reentrega" aqui. A decisão fica com o fluxo GM (Código.js).
+  // Rotas 610 sem dados GM: não forçar status
+  if (snapshot && gmRows.length === 0) {
     return false;
   } else {
+    atualizarSequenciaNomesSubtasksRunner(task, gmRows);
+
     let gmNoCliente = false;
     let gmCritico = false;
     gmRows.forEach((row) => {
@@ -979,13 +986,39 @@ function reconciliarStatusTaskPrincipal(taskId, snapshot, routeKey) {
       }
     });
 
+    // Verifica se todas as entregas GM foram finalizadas (todos os stops têm saída)
+    const todasEntregasGMFinalizadas = gmRows.length > 0 && gmRows.every(row => {
+      const departure = row["stop.actualDeparture"];
+      return temHorario(departure);
+    });
+
+    // Conta subtasks em aberto que são reentregas (status contém "reentrega" ou não está finalizado)
+    const subtasksEmAberto = subtasks.filter(sub => {
+      const st = String((sub.status && sub.status.status) || sub.status || "").toLowerCase();
+      return !isStatusFinal(st);
+    });
+
+    // Se todas as entregas GM finalizaram E ainda há subtasks em aberto, são reentregas
+    const somenteReentregasEmAberto = todasEntregasGMFinalizadas && subtasksEmAberto.length > 0;
+
     if (gmCritico || temCritico) {
       statusEsperado = "Crítico";
     } else if (gmNoCliente || temNoCliente) {
       statusEsperado = "No Cliente";
+    } else if (somenteReentregasEmAberto) {
+      // Todas entregas GM finalizadas, só restam reentregas em aberto -> Reentrega
+      statusEsperado = "Reentrega";
     } else if (todosFinalizados) {
+      // Se já está em "Reentrega", mantém (foi definido pelo Código.js quando há subtasks de reentrega)
+      if (lowerAtual === "reentrega") {
+        return false;
+      }
       statusEsperado = "Validar Finalização";
     } else {
+      // Se já está em "Reentrega", mantém
+      if (lowerAtual === "reentrega") {
+        return false;
+      }
       statusEsperado = "Em rota";
     }
   }
@@ -1011,6 +1044,86 @@ function parseHorarioMs(valor) {
   const date = new Date(valor);
   if (Number.isNaN(date.getTime())) return null;
   return date.getTime();
+}
+
+function removerPrefixoSequenciaNomeRunner(nome) {
+  const texto = String(nome || "").trim();
+  if (!texto) return "";
+  return texto.replace(/^\d+\s*(?:-|\.)\s*/, "").trim();
+}
+
+function atualizarSequenciaNomesSubtasksRunner(task, gmRows) {
+  if (!task || !Array.isArray(task.subtasks) || task.subtasks.length === 0) return;
+  if (!Array.isArray(gmRows) || gmRows.length === 0) return;
+
+  const subtasksDetalhes = buscarSubtasksDetalhes(task.subtasks.map(st => st.id).filter(Boolean));
+  if (!Array.isArray(subtasksDetalhes) || subtasksDetalhes.length === 0) return;
+
+  const subtaskPorIdGM = new Map();
+  subtasksDetalhes.forEach(sub => {
+    const idGM = extrairIdGM(sub);
+    if (!idGM) return;
+    subtaskPorIdGM.set(String(idGM).trim(), sub);
+  });
+  if (subtaskPorIdGM.size === 0) return;
+
+  const ordenadas = gmRows
+    .map(row => {
+      const idGM = String(row["stop.location.key"] || "").trim();
+      if (!idGM) return null;
+      const sub = subtaskPorIdGM.get(idGM);
+      if (!sub) return null;
+      const chegadaMs = parseHorarioMs(row["stop.actualArrival"]);
+      if (!chegadaMs) return null;
+      return {
+        subtaskId: sub.id,
+        subtaskNome: sub.name,
+        chegadaMs: chegadaMs,
+        createdMs: Number(sub.date_created) || 0
+      };
+    })
+    .filter(Boolean);
+
+  if (ordenadas.length === 0) return;
+
+  ordenadas.sort((a, b) => {
+    if (a.chegadaMs !== b.chegadaMs) return a.chegadaMs - b.chegadaMs;
+    if (a.createdMs !== b.createdMs) return a.createdMs - b.createdMs;
+    return String(a.subtaskId).localeCompare(String(b.subtaskId));
+  });
+
+  const updates = [];
+  ordenadas.forEach((item, idx) => {
+    const nomeBase = removerPrefixoSequenciaNomeRunner(item.subtaskNome);
+    if (!nomeBase) return;
+    const novoNome = `${idx + 1}. ${nomeBase}`;
+    const nomeAtual = String(item.subtaskNome || "").trim();
+    if (nomeAtual !== novoNome) {
+      updates.push({
+        subtaskId: item.subtaskId,
+        novoNome: novoNome
+      });
+    }
+  });
+
+  if (updates.length === 0) return;
+
+  const requests = updates.map(update => ({
+    url: `https://api.clickup.com/api/v2/task/${update.subtaskId}`,
+    method: "PUT",
+    payload: JSON.stringify({ name: update.novoNome })
+  }));
+  const responses = cuFetchBatch_("cu-name", requests);
+  responses.forEach((response, idx) => {
+    const update = updates[idx];
+    const code = response.getResponseCode();
+    if (code === 200 || code === 204) {
+      markClickUpPatched();
+      console.log(`   ✅ Nome da subtask atualizado: ${update.subtaskId} -> "${update.novoNome}"`);
+    } else {
+      console.warn(`   ⚠️ Erro ao atualizar nome da subtask ${update.subtaskId}: ${code}`);
+    }
+  });
 }
 
 function aplicarReentregaSemGreenMile(task) {
@@ -1101,59 +1214,7 @@ function buscarSubtasksDetalhes(subtaskIds) {
   return result;
 }
 
-function extrairCampoNfe(task) {
-  let fieldId = null;
-  let fieldValue = "";
-  if (task && Array.isArray(task.custom_fields)) {
-    const campoNF = task.custom_fields.find(cf =>
-      cf.name && (/notas? fiscais/i.test(cf.name) || /nfe/i.test(cf.name))
-    );
-    if (campoNF) {
-      fieldId = campoNF.id;
-      if (campoNF.value !== undefined && campoNF.value !== null) {
-        fieldValue = String(campoNF.value).trim();
-      }
-    }
-  }
-  return { fieldId, fieldValue };
-}
 
-function extrairNfesChecklist(task) {
-  if (!task || !Array.isArray(task.checklists)) return "";
-  const itens = [];
-  task.checklists.forEach((checklist) => {
-    if (checklist.items && Array.isArray(checklist.items)) {
-      checklist.items.forEach((item) => {
-        if (item.name) itens.push(item.name.trim());
-      });
-    }
-  });
-  return itens.join(", ");
-}
-
-function mergeNfes(valorAtual, valorChecklist) {
-  const set = new Set();
-  [valorAtual, valorChecklist].forEach((valor) => {
-    if (!valor) return;
-    String(valor).split(",").forEach((parte) => {
-      const item = String(parte).trim();
-      if (item) set.add(item);
-    });
-  });
-  return Array.from(set).join(", ");
-}
-
-function precisaAtualizarCampo(valorAtual, valorNovo) {
-  if (!valorNovo) return false;
-  if (!valorAtual) return true;
-  const atualSet = new Set(String(valorAtual).split(",").map(v => v.trim()).filter(Boolean));
-  const novoSet = new Set(String(valorNovo).split(",").map(v => v.trim()).filter(Boolean));
-  if (novoSet.size > atualSet.size) return true;
-  for (const item of novoSet) {
-    if (!atualSet.has(item)) return true;
-  }
-  return false;
-}
 
 function atualizarCampoPersonalizadoClickUpRunner(taskId, fieldId, valor) {
   if (!taskId || !fieldId) return false;
@@ -1571,7 +1632,68 @@ function buildDashModel(tasks, routeMap, snapshots, scriptProps, telemetry) {
     planosPorRegiao[regiaoKey] = (planosPorRegiao[regiaoKey] || 0) + 1;
     statusPlanosDistribuicao[statusTask] = (statusPlanosDistribuicao[statusTask] || 0) + 1;
 
-    // ... (rest of loop) ...
+    // Build MINIMAL clients summary (size optimization)
+    const clientesMini = [];
+    if (snapshot && snapshot.items) {
+      snapshot.items.forEach(stop => {
+        const clienteStatus = stop["stop.deliveryStatus"] || "PENDING";
+        statusClientesDistribuicao[clienteStatus] = (statusClientesDistribuicao[clienteStatus] || 0) + 1;
+
+        const stopKey = stop["stop.location.key"] || "";
+        const nomeCliente = stop["stop.location.description"] || "Cliente";
+        const chegada = stop["stop.actualArrival"];
+        const saidaStop = stop["stop.actualDeparture"];
+
+        // Parse dates defensively
+        const chegadaMs = parseDateSafe(chegada);
+        const saidaMs = parseDateSafe(saidaStop);
+
+        // Calculate time at client with full context
+        if (chegadaMs) {
+          let tempoNoCliente = null;
+          const finalizado = !!saidaMs;
+
+          if (saidaMs) {
+            tempoNoCliente = (saidaMs - chegadaMs) / 60000;
+          } else {
+            tempoNoCliente = (now - chegadaMs) / 60000;
+          }
+
+          if (tempoNoCliente !== null && tempoNoCliente > 0 && tempoNoCliente < 1440) { // < 24h sanity
+            const entry = {
+              tempoMin: Math.round(tempoNoCliente),
+              plano: plano,
+              taskId: fullTask.id,
+              routeKey: routeKey,
+              nomeCliente: nomeCliente.substring(0, 50),
+              stopKey: stopKey,
+              status: clienteStatus,
+              chegadaTs: chegadaMs
+            };
+
+            if (finalizado) {
+              temposFinalizados.push(entry);
+            } else {
+              temposAtivos.push(entry);
+            }
+          }
+        }
+
+        // Minimal client data
+        clientesMini.push({
+          k: stopKey,              // key
+          n: nomeCliente.substring(0, 40), // name truncated
+          s: clienteStatus,       // status
+          c: chegadaMs || null,   // chegada timestamp
+          f: saidaMs || null      // saida timestamp (finalizado)
+        });
+      });
+    }
+
+    // Store minimal clients (limit per plano)
+    if (clientesMini.length > 0) {
+      clientesSummary[fullTask.id] = clientesMini.slice(0, 30);
+    }
 
     planos.push({
       taskId: fullTask.id,
